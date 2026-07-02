@@ -3,7 +3,7 @@
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple
+from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 
 PYTHON_TAG = f"py{sys.version_info.major}{sys.version_info.minor}"
@@ -61,6 +61,8 @@ class ModelData:
     cost: np.ndarray
     min_demand: np.ndarray
     available_water: float
+    rainy_crops: Optional[Sequence[str]] = None
+    dry_crops: Optional[Sequence[str]] = None
     zone_demand_share: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
@@ -116,6 +118,11 @@ class ModelData:
             if shares.shape != matrix_shape:
                 raise ValueError("zone_demand_share must have shape (zones, crops).")
         self.zone_demand_share = shares
+
+        if self.rainy_crops is not None:
+            self.rainy_crops = tuple(str(crop).lower() for crop in self.rainy_crops)
+        if self.dry_crops is not None:
+            self.dry_crops = tuple(str(crop).lower() for crop in self.dry_crops)
 
 
 @dataclass
@@ -334,8 +341,10 @@ def solve_demand_level(
             row_lower[_flat(i, j, p)] = -0.8 * max_irrigation_per_area
             constraints.append((row_lower, ">=", 0.0))
 
-    rainy_names = {"rice", "maize", "peanut", "cotton", "姘寸ɑ", "鐜夌背", "鑺辩敓", "妫夎姳"}
-    dry_names = {"wheat", "rapeseed", "灏忛害", "娌硅彍"}
+    if data.rainy_crops is None or data.dry_crops is None:
+        raise ValueError("rainy_crops and dry_crops must be provided in ModelData.")
+    rainy_names = set(data.rainy_crops)
+    dry_names = set(data.dry_crops)
     rainy_crop_idx = [j for j, crop in enumerate(data.crops) if crop.lower() in rainy_names]
     dry_crop_idx = [j for j, crop in enumerate(data.crops) if crop.lower() in dry_names]
     unknown_crops = [
@@ -599,181 +608,8 @@ def export_results_to_csv(
     return out_dir
 
 
-def scenario_definitions() -> List[Dict[str, object]]:
-    return [
-        {
-            "scenario": "S0",
-            "supply_weights": (0.5, 0.5),
-            "demand_weights": (1 / 3, 1 / 3, 1 / 3),
-            "interpretation": "Equal-weight baseline",
-        },
-        {
-            "scenario": "S1",
-            "supply_weights": (0.7, 0.3),
-            "demand_weights": (0.5, 0.25, 0.25),
-            "interpretation": "Economy-oriented",
-        },
-        {
-            "scenario": "S2",
-            "supply_weights": (0.3, 0.7),
-            "demand_weights": (0.25, 0.5, 0.25),
-            "interpretation": "Water-saving-oriented",
-        },
-        {
-            "scenario": "S3",
-            "supply_weights": (0.5, 0.5),
-            "demand_weights": (0.25, 0.25, 0.5),
-            "interpretation": "Pollution-mitigation-oriented",
-        },
-        {
-            "scenario": "S4",
-            "supply_weights": (0.4, 0.6),
-            "demand_weights": (0.2, 0.4, 0.4),
-            "interpretation": "Water-environment-oriented",
-        },
-        {
-            "scenario": "S5",
-            "supply_weights": (0.8, 0.2),
-            "demand_weights": (0.6, 0.2, 0.2),
-            "interpretation": "Strong economy preference",
-        },
-        {
-            "scenario": "S6",
-            "supply_weights": (0.2, 0.8),
-            "demand_weights": (0.2, 0.5, 0.3),
-            "interpretation": "Strong water-saving preference",
-        },
-    ]
-
-
-def export_scenario_summary_to_csv(
-    data: ModelData,
-    output_dir: str | Path = "results_csv",
-) -> pd.DataFrame:
-    rows = []
-    for scenario in scenario_definitions():
-        result = solve_two_stage_extremum(
-            data,
-            supply_weights=scenario["supply_weights"],
-            demand_weights=scenario["demand_weights"],
-        )
-        interval = result["interval_solution"]
-        economic_lower, economic_upper = interval["economic_benefit"]
-        irrigation_lower, irrigation_upper = interval["irrigation_water"]
-        grey_lower, grey_upper = interval["grey_water"]
-
-        best_supply = result["cases"]["best"]["supply"]
-        worst_supply = result["cases"]["worst"]["supply"]
-        best_demand = result["cases"]["best"]["demand"]
-        worst_demand = result["cases"]["worst"]["demand"]
-        rows.append(
-            {
-                "scenario": scenario["scenario"],
-                "interpretation": scenario["interpretation"],
-                "supply_weights": ", ".join(str(x) for x in scenario["supply_weights"]),
-                "demand_weights": ", ".join(str(x) for x in scenario["demand_weights"]),
-                "economic_lower_CNY": economic_lower,
-                "economic_upper_CNY": economic_upper,
-                "economic_lower_1e9_CNY": economic_lower / 1e9,
-                "economic_upper_1e9_CNY": economic_upper / 1e9,
-                "irrigation_lower_m3": irrigation_lower,
-                "irrigation_upper_m3": irrigation_upper,
-                "irrigation_lower_1e9_m3": irrigation_lower / 1e9,
-                "irrigation_upper_1e9_m3": irrigation_upper / 1e9,
-                "grey_lower_m3": grey_lower,
-                "grey_upper_m3": grey_upper,
-                "grey_lower_1e9_m3": grey_lower / 1e9,
-                "grey_upper_1e9_m3": grey_upper / 1e9,
-                "best_supply_weighted_objective": best_supply["weighted_objective"],
-                "worst_supply_weighted_objective": worst_supply["weighted_objective"],
-                "best_demand_weighted_objective": best_demand["weighted_objective"],
-                "worst_demand_weighted_objective": worst_demand["weighted_objective"],
-            }
-        )
-
-    frame = pd.DataFrame(rows)
-    out_dir = Path(output_dir)
-    if not out_dir.is_absolute():
-        out_dir = Path(__file__).with_name(str(out_dir))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    output_path = out_dir / "scenario_summary.csv"
-    try:
-        frame.to_csv(output_path, index=False, encoding="utf-8-sig")
-    except PermissionError:
-        output_path = out_dir / "scenario_summary_unscaled.csv"
-        frame.to_csv(output_path, index=False, encoding="utf-8-sig")
-    frame.attrs["output_path"] = output_path
-    return frame
-
-
-def build_toy_data() -> ModelData:
-    raise RuntimeError("Case data has been removed. Provide a ModelData instance before running the solver.")
-
 def main() -> None:
-    data = build_toy_data()
-
-    result = solve_two_stage_extremum(
-        data,
-        supply_weights=(0.5, 0.5),
-        demand_weights=(1 / 3, 1 / 3, 1 / 3),
-    )
-
-    for case in ("best", "worst"):
-        supply = result["cases"][case]["supply"]
-        demand = result["cases"][case]["demand"]
-        print(f"\n=== {case.upper()} CASE ===")
-        print(
-            "Supply: benefit={:.2f}, entitlement={:.2f}, weighted={:.2f}".format(
-                supply["economic_benefit"],
-                supply["total_entitlement"],
-                supply["weighted_objective"],
-            )
-        )
-        print(
-            "Demand: benefit={:.2f}, irrigation={:.2f}, grey={:.2f}, weighted={:.2f}".format(
-                demand["economic_benefit"],
-                demand["irrigation_water"],
-                demand["grey_water"],
-                demand["weighted_objective"],
-            )
-        )
-        print("\nWater entitlement WE:")
-        print(to_long_table(supply["WE"], data.zones, data.crops, "WE").to_string(index=False))
-        print("\nCropping area x:")
-        print(to_long_table(demand["x"], data.zones, data.crops, "x").to_string(index=False))
-
-    interval = result["interval_solution"]
-    print("\n=== INTERVAL SOLUTION ===")
-    print("Economic benefit interval:", interval["economic_benefit"])
-    print("Irrigation water interval:", interval["irrigation_water"])
-    print("Grey water interval:", interval["grey_water"])
-    print("\nWE interval:")
-    print(interval_to_long_table(interval["WE"], data.zones, data.crops, "WE").to_string(index=False))
-    print("\nx interval:")
-    print(interval_to_long_table(interval["x"], data.zones, data.crops, "x").to_string(index=False))
-    print("\ny interval:")
-    print(interval_to_long_table(interval["y"], data.zones, data.crops, "y").to_string(index=False))
-
-    output_dir = export_results_to_csv(data, result)
-    print(f"\nCSV results exported to: {output_dir}")
-
-    scenario_summary = export_scenario_summary_to_csv(data)
-    print("\n=== SCENARIO SUMMARY ===")
-    print(
-        scenario_summary[
-            [
-                "scenario",
-                "economic_lower_1e9_CNY",
-                "economic_upper_1e9_CNY",
-                "irrigation_lower_1e9_m3",
-                "irrigation_upper_1e9_m3",
-                "grey_lower_1e9_m3",
-                "grey_upper_1e9_m3",
-            ]
-        ].to_string(index=False)
-    )
-    scenario_output = scenario_summary.attrs.get("output_path", output_dir / "scenario_summary.csv")
-    print(f"\nScenario summary exported to: {scenario_output}")
+    raise RuntimeError("No embedded case data. Construct ModelData and call solve_two_stage_extremum(data).")
 
 
 if __name__ == "__main__":
